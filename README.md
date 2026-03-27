@@ -4,6 +4,10 @@ Routes commercetools order events to an AWS SQS queue via EventBridge, then cons
 
 ## Architecture
 
+![Dedicated vs Shared EventBridge bus for commercetools](./event-bridge.png)
+
+> This project uses a **dedicated event bus** (recommended): a new bus created solely for the commercetools partner event source, giving full isolation, independent IAM policies, and scoped CloudWatch metrics. Reusing the AWS default or an existing shared bus is not viable — the CT partner source cannot attach to the default bus, and sharing introduces mixed IAM policies, noisy metrics, and no independent kill-switch.
+
 ```
 commercetools Platform
         │  order events (OrderCreated, etc.)

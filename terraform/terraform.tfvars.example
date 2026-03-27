@@ -1,0 +1,18 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# Never commit terraform.tfvars to source control.
+
+# ── AWS ──────────────────────────────────────────────────────────────────────
+aws_region     = "us-east-1"
+aws_account_id = "123456789012"
+environment    = "dev"
+
+# ── commercetools ─────────────────────────────────────────────────────────────
+ct_project_key   = "my-project"
+ct_client_id     = "xxxxxxxxxxxxxxxxxxxxxxxx"
+ct_client_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ct_scopes        = "manage_subscriptions:my-project"
+ct_api_url       = "https://api.us-central1.gcp.commercetools.com"
+ct_auth_url      = "https://auth.us-central1.gcp.commercetools.com"
+
+# ── Subscription ──────────────────────────────────────────────────────────────
+subscription_key = "eventbridge-subscription"

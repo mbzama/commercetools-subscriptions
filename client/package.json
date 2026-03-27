@@ -1,0 +1,14 @@
+{
+  "name": "ct-order-events-consumer",
+  "version": "1.0.0",
+  "description": "Reads commercetools order events from the ct-order-events SQS queue",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.0.0",
+    "dotenv": "^16.0.0"
+  }
+}

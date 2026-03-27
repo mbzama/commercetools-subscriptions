@@ -1,0 +1,29 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfstate.backup
+terraform/terraform.tfvars
+terraform/*.auto.tfvars
+terraform/crash.log
+terraform/crash.*.log
+terraform/*.tfplan
+terraform/.terraform.lock.hcl
+terraform/override.tf
+terraform/override.tf.json
+
+# Node / client
+client/node_modules/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Claude local settings
+**/.claude/settings.local.json

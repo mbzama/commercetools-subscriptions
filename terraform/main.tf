@@ -11,6 +11,49 @@ locals {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 0.  CloudWatch Logs resource policy – required for commercetools to validate
+#     the EventBridge subscription destination during creation
+# ─────────────────────────────────────────────────────────────────────────────
+
+resource "aws_cloudwatch_log_resource_policy" "eventbridge_delivery" {
+  policy_name = "${local.name_prefix}-eventbridge-log-delivery"
+
+  policy_document = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AWSLogDeliveryWrite"
+        Effect = "Allow"
+        Principal = {
+          Service = "delivery.logs.amazonaws.com"
+        }
+        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "arn:aws:logs:us-east-2:${var.aws_account_id}:log-group:/aws/vendedlogs/events/event-bus/aws.partner/commercetools.com/${var.ct_project_key}/${var.subscription_key}:*"
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = var.aws_account_id
+          }
+        }
+      },
+      {
+        Sid    = "AWSLogDeliveryAclCheck"
+        Effect = "Allow"
+        Principal = {
+          Service = "delivery.logs.amazonaws.com"
+        }
+        Action   = ["logs:DescribeLogGroups"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = var.aws_account_id
+          }
+        }
+      }
+    ]
+  })
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 1.  commercetools Subscription → creates the partner event source in AWS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -31,6 +74,8 @@ resource "commercetools_subscription" "eventbridge" {
   lifecycle {
     create_before_destroy = false
   }
+
+  depends_on = [aws_cloudwatch_log_resource_policy.eventbridge_delivery]
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,14 +102,14 @@ resource "aws_cloudwatch_event_bus" "commercetools" {
 resource "aws_sqs_queue" "dlq" {
   name                      = "${local.name_prefix}-ct-order-events-dlq"
   message_retention_seconds = var.sqs_message_retention_seconds
-  kms_master_key_id         = "alias/aws/sqs"
+  sqs_managed_sse_enabled   = true
 
   tags = local.common_tags
 }
 
 resource "aws_sqs_queue" "order_events" {
   name                       = "ct-order-events"
-  kms_master_key_id          = "alias/aws/sqs"
+  sqs_managed_sse_enabled    = true
   visibility_timeout_seconds = 60
 
   redrive_policy = jsonencode({
@@ -113,7 +158,9 @@ resource "aws_cloudwatch_event_rule" "order" {
 
   event_pattern = jsonencode({
     detail = {
-      resource_type_id = ["order"]
+      resource = {
+        typeId = ["order"]
+      }
     }
   })
 

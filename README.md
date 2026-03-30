@@ -291,6 +291,86 @@ cd terraform && terraform destroy
 
 ---
 
+## Teardown
+
+Remove the environment in this exact order. Reversing the order will leave orphaned resources.
+
+---
+
+### Step 1 — Stop the Node.js consumer
+
+```bash
+# Ctrl+C in the terminal running npm start
+# or if running as a background process:
+pkill -f "node src/index.js"
+```
+
+---
+
+### Step 2 — Destroy AWS infrastructure (Terraform)
+
+Removes the event bus, rule, SQS queues, and CloudWatch Logs resource policy.
+
+```bash
+cd terraform
+terraform destroy -auto-approve
+```
+
+> **Why before Step 3?** The event bus must be deleted before the CT subscription is deleted. If you delete the CT subscription first, the partner event source disappears from AWS and Terraform loses its reference — `terraform destroy` will error.
+
+---
+
+### Step 3 — Delete the CT subscription (removes partner event source from AWS)
+
+Get a token, then delete the subscription by key.
+
+```bash
+# Get token
+TOKEN=$(curl -sf -X POST "https://auth.us-east-2.aws.commercetools.com/oauth/token" \
+  -u "$CT_CLIENT_ID:$CT_CLIENT_SECRET" \
+  -d "grant_type=client_credentials&scope=manage_subscriptions:$CT_PROJECT_KEY" \
+  | jq -r '.access_token')
+
+# Get current version
+VERSION=$(curl -s "https://api.us-east-2.aws.commercetools.com/$CT_PROJECT_KEY/subscriptions/key=orders-dev1" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.version')
+
+# Delete
+curl -s -X DELETE "https://api.us-east-2.aws.commercetools.com/$CT_PROJECT_KEY/subscriptions/key=orders-dev1?version=$VERSION" \
+  -H "Authorization: Bearer $TOKEN" | jq '{id, key}'
+```
+
+Deleting the subscription removes the partner event source `aws.partner/commercetools.com/<project>/orders-dev1` from AWS automatically.
+
+---
+
+### Step 4 — Verify everything is removed
+
+```bash
+# Confirm no CT subscriptions remain
+TOKEN=$(curl -sf -X POST "https://auth.us-east-2.aws.commercetools.com/oauth/token" \
+  -u "$CT_CLIENT_ID:$CT_CLIENT_SECRET" \
+  -d "grant_type=client_credentials&scope=manage_subscriptions:$CT_PROJECT_KEY" \
+  | jq -r '.access_token')
+
+curl -s "https://api.us-east-2.aws.commercetools.com/$CT_PROJECT_KEY/subscriptions" \
+  -H "Authorization: Bearer $TOKEN" | jq '{total: .total}'
+
+# Confirm no event buses remain
+aws events list-event-buses \
+  --name-prefix "aws.partner/commercetools.com" \
+  --region us-east-2 | jq '.EventBuses | length'
+
+# Confirm SQS queues are gone
+aws sqs list-queues \
+  --queue-name-prefix "ct-order-events" \
+  --region us-east-2 | jq '.QueueUrls'
+```
+
+Expected output: `{ "total": 0 }`, `0`, `null`
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

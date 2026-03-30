@@ -54,38 +54,12 @@ resource "aws_cloudwatch_log_resource_policy" "eventbridge_delivery" {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1.  commercetools Subscription → creates the partner event source in AWS
-# ─────────────────────────────────────────────────────────────────────────────
-
-resource "commercetools_subscription" "eventbridge" {
-  key = var.subscription_key
-
-  destination {
-    type       = "EventBridge"
-    account_id = var.aws_account_id
-    region     = var.aws_region
-  }
-
-  message {
-    resource_type_id = "order"
-    types            = []
-  }
-
-  lifecycle {
-    create_before_destroy = false
-  }
-
-  depends_on = [aws_cloudwatch_log_resource_policy.eventbridge_delivery]
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  Associate the partner event source with a custom event bus
+# 1.  Look up the partner event source created by the CT subscription
+#     Run scripts/create-ct-subscription.sh before applying this Terraform.
 # ─────────────────────────────────────────────────────────────────────────────
 
 data "aws_cloudwatch_event_source" "commercetools" {
   name_prefix = local.partner_event_source_name
-
-  depends_on = [commercetools_subscription.eventbridge]
 }
 
 resource "aws_cloudwatch_event_bus" "commercetools" {

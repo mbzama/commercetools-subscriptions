@@ -8,9 +8,9 @@ output "event_bus_arn" {
   value       = aws_cloudwatch_event_bus.commercetools.arn
 }
 
-output "subscription_id" {
-  description = "commercetools subscription ID"
-  value       = commercetools_subscription.eventbridge.id
+output "subscription_key" {
+  description = "commercetools subscription key"
+  value       = var.subscription_key
 }
 
 output "partner_event_source_name" {

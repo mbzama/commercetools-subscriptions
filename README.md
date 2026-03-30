@@ -2,20 +2,48 @@
 
 Routes commercetools order events to an AWS SQS queue via EventBridge, then consumes them with a Node.js client.
 
+## How It Works
+
+The setup is split into two deliberate stages:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  STAGE 1 — commercetools API                                    │
+│                                                                 │
+│  Call the CT Subscriptions API to create an EventBridge         │
+│  subscription. CT registers a partner event source in AWS:      │
+│                                                                 │
+│    aws.partner/commercetools.com/<project>/<subscription-key>   │
+│                                                                 │
+│  No AWS credentials needed. No CT secrets in Terraform.         │
+└─────────────────────┬───────────────────────────────────────────┘
+                      │ partner event source appears in AWS
+                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  STAGE 2 — Terraform (AWS only)                                 │
+│                                                                 │
+│  Reads the partner event source by name and provisions:         │
+│  • CloudWatch Logs resource policy                              │
+│  • Custom EventBridge event bus                                 │
+│  • EventBridge rule (filter: order events)                      │
+│  • SQS queue + Dead-letter queue                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+> **Why split?** CT API credentials (client ID, secret) never touch Terraform state or `.tfvars` files. Terraform only needs AWS credentials.
+
 ## Architecture
 
 ![Dedicated vs Shared EventBridge bus for commercetools](./event-bridge.png)
 
-> This project uses a **dedicated event bus** (recommended): a new bus created solely for the commercetools partner event source, giving full isolation, independent IAM policies, and scoped CloudWatch metrics. Reusing the AWS default or an existing shared bus is not viable — the CT partner source cannot attach to the default bus, and sharing introduces mixed IAM policies, noisy metrics, and no independent kill-switch.
-
 ```
 commercetools Platform
-        │  order events (OrderCreated, OrderStateChanged, etc.)
+        │  OrderCreated, OrderStateChanged
         ▼
-commercetools Subscription (EventBridge destination)
-        │  partner event source
+CT Subscriptions API  ←── Stage 1: you call this once
+        │  creates partner event source in AWS
         ▼
-AWS EventBridge (Custom Event Bus)
+AWS EventBridge (Custom Event Bus)  ←── Stage 2: Terraform manages this
         │  rule: detail.resource.typeId = "order"
         ▼
 SQS Queue: ct-order-events
@@ -30,52 +58,168 @@ SQS Dead-Letter Queue (DLQ)
 ## Repository Structure
 
 ```
-├── terraform/      # Infrastructure as code — provisions all AWS + commercetools resources
-└── client/         # Node.js SQS consumer — polls the queue and processes order events
+├── scripts/        # CT API helpers — create/delete subscriptions without Terraform
+├── terraform/      # AWS infrastructure only — no CT secrets
+└── client/         # Node.js SQS consumer
 ```
 
 ---
 
-## terraform/
-
-Terraform configuration that provisions the full event pipeline end-to-end:
-
-| Resource | Purpose |
-|---|---|
-| `aws_cloudwatch_log_resource_policy` | Grants `delivery.logs.amazonaws.com` write access — required for CT to validate the EventBridge destination on subscription creation |
-| `commercetools_subscription` | Creates the CT subscription with an EventBridge destination |
-| `aws_cloudwatch_event_bus` | Custom event bus associated with the CT partner event source |
-| `aws_cloudwatch_event_rule` | Filters events where `detail.resource.typeId = "order"` |
-| `aws_sqs_queue` (ct-order-events) | Main queue holding matched order events |
-| `aws_sqs_queue` (DLQ) | Dead-letter queue for messages that fail 3 delivery attempts |
+## Setup
 
 ### Prerequisites
 
-- Terraform >= 1.3.0
-- AWS credentials with permissions to manage EventBridge, SQS, CloudWatch Logs, and IAM policies
-- commercetools API client with scope `manage_subscriptions:<project-key>`
+| Tool | Purpose |
+|---|---|
+| `curl` + `jq` | Stage 1 — call the CT API |
+| Terraform >= 1.3.0 | Stage 2 — provision AWS resources |
+| AWS credentials | Permissions for EventBridge, SQS, CloudWatch Logs, IAM |
+| CT API client | Scope: `manage_subscriptions:<project-key>` |
 
-### IAM Policies
+---
 
-Three separate permission grants are required for the pipeline to work end-to-end. Missing any one of them causes silent failures.
+### Stage 1 — CT API creates the EventBridge partner event source
 
-#### 1. CloudWatch Logs resource policy (subscription validation)
+> **This runs once per environment.** CT registers a partner event source in your AWS account that Terraform reads in Stage 2.
 
-commercetools validates the EventBridge destination during subscription creation by checking that `delivery.logs.amazonaws.com` can write to the vended log group for that event bus:
+```bash
+export CT_CLIENT_ID=<your-client-id>
+export CT_CLIENT_SECRET=<your-client-secret>
+export CT_PROJECT_KEY=ps-ecomm-dev1
+export CT_AUTH_URL=https://auth.us-east-2.aws.commercetools.com
+export CT_API_URL=https://api.us-east-2.aws.commercetools.com
+export AWS_ACCOUNT_ID=<your-aws-account-id>
+export AWS_REGION=us-east-2
+export SUBSCRIPTION_KEY=orders-dev1
+
+bash scripts/create-ct-subscription.sh
+```
+
+The script:
+1. Fetches a short-lived CT token — credentials are never written to disk
+2. Checks if the subscription already exists (idempotent — safe to re-run)
+3. Creates the subscription, which causes CT to register the partner event source in AWS:
+   ```
+   aws.partner/commercetools.com/ps-ecomm-dev1/orders-dev1
+   ```
+
+**Verify the partner event source was created:**
+```bash
+# Get token
+TOKEN=$(curl -sf -X POST "$CT_AUTH_URL/oauth/token" \
+  -u "$CT_CLIENT_ID:$CT_CLIENT_SECRET" \
+  -d "grant_type=client_credentials&scope=manage_subscriptions:$CT_PROJECT_KEY" \
+  | jq -r '.access_token')
+
+# List subscriptions
+curl -s "$CT_API_URL/$CT_PROJECT_KEY/subscriptions" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq '.results[] | {key, status, source: .destination.source}'
+```
+
+Expected output:
+```json
+{
+  "key": "orders-dev1",
+  "status": "Healthy",
+  "source": "aws.partner/commercetools.com/ps-ecomm-dev1/orders-dev1"
+}
+```
+
+---
+
+### Stage 2 — Terraform provisions the AWS event bus, rule, and SQS queue
+
+> **Run this after Stage 1.** Terraform looks up the partner event source by name and builds all AWS resources around it.
+
+**1. Configure variables** (no CT secrets required):
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+```
+
+Edit `terraform.tfvars`:
+
+```hcl
+aws_region       = "us-east-2"
+aws_account_id   = "<your-aws-account-id>"
+environment      = "dev"
+ct_project_key   = "ps-ecomm-dev1"
+subscription_key = "orders-dev1"   # must match the key used in Stage 1
+```
+
+**2. Apply:**
+
+```bash
+terraform init
+terraform plan
+terraform apply
+```
+
+Terraform creates:
+
+| Resource | Name / ARN |
+|---|---|
+| CloudWatch Logs resource policy | `ps-ecomm-dev1-dev-eventbridge-log-delivery` |
+| EventBridge event bus | `aws.partner/commercetools.com/ps-ecomm-dev1/orders-dev1` |
+| EventBridge rule | `ps-ecomm-dev1-dev-ct-order-rule` |
+| SQS queue | `ct-order-events` |
+| SQS dead-letter queue | `ps-ecomm-dev1-dev-ct-order-events-dlq` |
+
+**3. Note the outputs:**
+
+```
+order_events_queue_url = "https://sqs.us-east-2.amazonaws.com/..."
+dlq_url                = "https://sqs.us-east-2.amazonaws.com/..."
+event_bus_name         = "aws.partner/commercetools.com/ps-ecomm-dev1/orders-dev1"
+```
+
+---
+
+### Stage 3 — Start the Node.js consumer
+
+```bash
+cd client
+npm install
+cp .env.example .env
+# fill in AWS_REGION and SQS_QUEUE_URL from terraform output
+npm start
+```
+
+**Required environment variables** (`client/.env`):
+
+| Variable | Description |
+|---|---|
+| `AWS_REGION` | `us-east-2` |
+| `SQS_QUEUE_URL` | From `terraform output order_events_queue_url` |
+| `AWS_ACCESS_KEY_ID` | AWS access key |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
+| `AWS_SESSION_TOKEN` | Required when using temporary credentials |
+
+---
+
+## IAM Policies
+
+Three permission grants are required. Missing any one causes silent failures.
+
+### 1. CloudWatch Logs resource policy (Stage 1 prerequisite)
+
+CT validates the EventBridge destination during subscription creation by checking that `delivery.logs.amazonaws.com` can write to the vended log group:
 
 ```
 /aws/vendedlogs/events/event-bus/aws.partner/commercetools.com/<project>/<subscription-key>
 ```
 
-This is provisioned by `aws_cloudwatch_log_resource_policy` in Terraform. Without it, subscription creation fails with:
+Provisioned by `aws_cloudwatch_log_resource_policy` in Terraform. Without it, CT rejects the subscription with:
 
 > _Permissions are set correctly to allow AWS CloudWatch Logs to write into your logs while creating a subscription._
 
-The `commercetools_subscription` resource has `depends_on` this policy so Terraform creates it first.
+> **Important:** Run `terraform apply` (Stage 2) **before** creating the CT subscription (Stage 1) so this policy exists when CT validates the destination.
 
-#### 2. SQS queue policy (EventBridge → SQS delivery)
+### 2. SQS queue policy (EventBridge → SQS delivery)
 
-The main queue has a resource-based policy allowing `events.amazonaws.com` to call `sqs:SendMessage`, scoped to the specific rule ARN:
+Allows `events.amazonaws.com` to send messages, scoped to the specific rule ARN:
 
 ```json
 {
@@ -89,22 +233,24 @@ The main queue has a resource-based policy allowing `events.amazonaws.com` to ca
 }
 ```
 
-This is provisioned by `aws_sqs_queue_policy` in Terraform.
+Provisioned by `aws_sqs_queue_policy` in Terraform.
 
-#### 3. SQS encryption — use SSE-SQS, not SSE-KMS with the AWS managed key
+### 3. SQS encryption — SSE-SQS, not SSE-KMS
 
-Both queues use `sqs_managed_sse_enabled = true` (SSE-SQS). **Do not use `kms_master_key_id = "alias/aws/sqs"`** (SSE-KMS with the AWS managed key).
+Both queues use `sqs_managed_sse_enabled = true`. **Do not use `kms_master_key_id = "alias/aws/sqs"`.**
 
-| Encryption mode | How it works | EventBridge compatible |
+| Mode | How it works | EventBridge compatible |
 |---|---|---|
-| `sqs_managed_sse_enabled = true` | SQS encrypts internally — no KMS API call from the caller | **Yes** |
-| `kms_master_key_id = "alias/aws/sqs"` | Calls KMS API — EventBridge needs `kms:GenerateDataKey` on that key, which the AWS managed key policy does not grant to other services | **No** — delivery silently fails |
+| `sqs_managed_sse_enabled = true` | SQS encrypts internally — no KMS call from the caller | **Yes** |
+| `kms_master_key_id = "alias/aws/sqs"` | Calls KMS API — EventBridge lacks `kms:GenerateDataKey` on the AWS managed key | **No** — delivery silently fails |
 
-If SSE-KMS is required (e.g. for key rotation or cross-account access), use a **customer-managed KMS key** and add an explicit statement granting `events.amazonaws.com` the `kms:GenerateDataKey` and `kms:Decrypt` actions.
+For SSE-KMS, use a customer-managed key with an explicit grant to `events.amazonaws.com` for `kms:GenerateDataKey` and `kms:Decrypt`.
 
-### EventBridge Rule Pattern
+---
 
-The event rule matches on the actual commercetools event structure — **not** the flat `resource_type_id` field:
+## EventBridge Rule Pattern
+
+The rule matches on the actual CT event structure. **Do not use the flat `resource_type_id` field** — it does not exist in the event payload.
 
 ```json
 {
@@ -116,99 +262,55 @@ The event rule matches on the actual commercetools event structure — **not** t
 }
 ```
 
-Using `detail.resource_type_id` (snake_case, flat) will result in `NO_STANDARD_RULES_MATCHED` in EventBridge logs — the field does not exist in the event payload.
+---
 
-### Setup
+## Managing Subscriptions
 
+**List all subscriptions:**
 ```bash
-cd terraform
+curl -s "$CT_API_URL/$CT_PROJECT_KEY/subscriptions" \
+  -H "Authorization: Bearer $TOKEN" \
+  | jq '.results[] | {key, status, source: .destination.source}'
+```
 
-# 1. Copy and fill in your credentials
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars — never commit this file
+**Delete a subscription:**
+```bash
+# Get version first
+curl -s "$CT_API_URL/$CT_PROJECT_KEY/subscriptions/key=<KEY>" \
+  -H "Authorization: Bearer $TOKEN" | jq '{key, version}'
 
-# 2. Initialize providers
-terraform init
+# Delete
+curl -s -X DELETE "$CT_API_URL/$CT_PROJECT_KEY/subscriptions/key=<KEY>?version=<VERSION>" \
+  -H "Authorization: Bearer $TOKEN" | jq '{id, key}'
+```
 
-# 3. Preview changes
-terraform plan
-
-# 4. Apply
-terraform apply
+**Tear down all AWS resources:**
+```bash
+cd terraform && terraform destroy
 ```
 
 ---
-
-## client/
-
-Node.js application that long-polls the `ct-order-events` SQS queue and processes each message.
-
-| File | Purpose |
-|---|---|
-| `src/index.js` | Entry point — validates env vars, starts the poll loop |
-| `src/consumer.js` | Receives, processes, and deletes SQS messages; handles retries and DLQ fallback |
-
-### Prerequisites
-
-- Node.js >= 18
-- AWS credentials with `sqs:ReceiveMessage` and `sqs:DeleteMessage` permissions on the queue
-
-### Setup
-
-```bash
-cd client
-
-# 1. Install dependencies
-npm install
-
-# 2. Configure environment
-cp .env.example .env
-# Edit .env — never commit this file
-```
-
-**Required environment variables** (in `client/.env`):
-
-| Variable | Description |
-|---|---|
-| `AWS_REGION` | AWS region where the SQS queue lives (e.g. `us-east-2`) |
-| `SQS_QUEUE_URL` | Full URL of the `ct-order-events` queue (from Terraform output) |
-| `AWS_ACCESS_KEY_ID` | AWS access key |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
-| `AWS_SESSION_TOKEN` | Session token (required when using temporary credentials) |
-
-### Running
-
-```bash
-# Production
-npm start
-
-# Development (auto-restarts on file changes)
-npm run dev
-```
-
-The consumer logs each received message and deletes it after successful processing. Failed messages (unhandled exceptions) are left in the queue and become visible again after the visibility timeout (60 s), up to 3 attempts before moving to the DLQ.
-
-To add business logic, edit the `processMessage` function in `src/consumer.js`.
-
----
-
-## Security
-
-- `terraform/terraform.tfvars` and `client/.env` are git-ignored — never commit credentials
-- SQS queues use SSE-SQS (`sqs_managed_sse_enabled = true`) — managed by SQS, compatible with all AWS service principals
-- The SQS queue policy restricts `sqs:SendMessage` to EventBridge only, scoped by rule ARN
-- For production, use IAM roles instead of long-lived access keys for the Node.js consumer
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Subscription creation fails with CloudWatch Logs permissions error | `aws_cloudwatch_log_resource_policy` not created before the subscription | Ensure `depends_on = [aws_cloudwatch_log_resource_policy.eventbridge_delivery]` is set on the subscription resource |
+| CT subscription creation fails with CloudWatch Logs permissions error | CloudWatch Logs resource policy doesn't exist yet | Run `terraform apply` (Stage 2) before creating the CT subscription (Stage 1) |
 | EventBridge logs show `NO_STANDARD_RULES_MATCHED` | Rule pattern uses `detail.resource_type_id` instead of `detail.resource.typeId` | Update the event pattern to use the nested `resource.typeId` field |
-| Rule logs show `RULE_MATCH_START` but no messages appear in SQS or DLQ | Queue encrypted with SSE-KMS (`alias/aws/sqs`) — EventBridge cannot call `kms:GenerateDataKey` on the AWS managed key | Switch to `sqs_managed_sse_enabled = true`, or use a CMK with an explicit grant to `events.amazonaws.com` |
+| `RULE_MATCH_START` in logs but no messages in SQS or DLQ | Queue uses SSE-KMS with `alias/aws/sqs` — EventBridge can't call `kms:GenerateDataKey` | Switch to `sqs_managed_sse_enabled = true` |
+| `DuplicateField` error on subscription creation | Subscription key already exists in CT | Use a different key or delete the existing subscription first |
+
+---
+
+## Security
+
+- CT credentials (`CT_CLIENT_ID`, `CT_CLIENT_SECRET`) are only used in Stage 1 as shell env vars — never written to Terraform state or `.tfvars` files
+- `terraform/terraform.tfvars` and `client/.env` are git-ignored
+- SQS queues use SSE-SQS — transparent encryption, no KMS overhead
+- SQS queue policy restricts delivery to EventBridge only, scoped by rule ARN
+- For production, use IAM roles instead of long-lived access keys for the Node.js consumer
 
 ## References
 
 - [commercetools Subscriptions + EventBridge tutorial](https://docs.commercetools.com/tutorials/subscriptions-eventbridge)
-- [commercetools Terraform provider](https://registry.terraform.io/providers/labd/commercetools/latest/docs)
 - [AWS EventBridge partner event sources](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-saas.html)

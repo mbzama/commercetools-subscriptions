@@ -121,7 +121,90 @@ resource "aws_sqs_queue_policy" "order_events" {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  EventBridge rule → routes order events to the SQS queue
+# 4.  SQS queue for cart events + dead-letter queue
+# ─────────────────────────────────────────────────────────────────────────────
+
+resource "aws_sqs_queue" "cart_dlq" {
+  name                      = "${local.name_prefix}-ct-cart-events-dlq"
+  message_retention_seconds = var.sqs_message_retention_seconds
+  sqs_managed_sse_enabled   = true
+
+  tags = local.common_tags
+}
+
+resource "aws_sqs_queue" "cart_events" {
+  name                       = "ct-cart-events"
+  sqs_managed_sse_enabled    = true
+  visibility_timeout_seconds = 60
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.cart_dlq.arn
+    maxReceiveCount     = 3
+  })
+
+  tags = merge(local.common_tags, { ResourceType = "cart" })
+}
+
+data "aws_iam_policy_document" "sqs_eventbridge_cart" {
+  statement {
+    sid     = "AllowEventBridgePublish"
+    effect  = "Allow"
+    actions = ["sqs:SendMessage"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["events.amazonaws.com"]
+    }
+
+    resources = [aws_sqs_queue.cart_events.arn]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+      values   = [aws_cloudwatch_event_rule.cart.arn]
+    }
+  }
+}
+
+resource "aws_sqs_queue_policy" "cart_events" {
+  queue_url = aws_sqs_queue.cart_events.id
+  policy    = data.aws_iam_policy_document.sqs_eventbridge_cart.json
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  EventBridge rule → routes cart events to the cart SQS queue
+# ─────────────────────────────────────────────────────────────────────────────
+
+resource "aws_cloudwatch_event_rule" "cart" {
+  name           = "${local.name_prefix}-ct-cart-rule"
+  description    = "Route commercetools cart events to SQS"
+  event_bus_name = aws_cloudwatch_event_bus.commercetools.name
+  state          = "ENABLED"
+
+  event_pattern = jsonencode({
+    detail = {
+      resource = {
+        typeId = ["cart"]
+      }
+    }
+  })
+
+  tags = merge(local.common_tags, { ResourceType = "cart" })
+}
+
+resource "aws_cloudwatch_event_target" "cart_sqs" {
+  rule           = aws_cloudwatch_event_rule.cart.name
+  event_bus_name = aws_cloudwatch_event_bus.commercetools.name
+  target_id      = "sqs-cart"
+  arn            = aws_sqs_queue.cart_events.arn
+
+  dead_letter_config {
+    arn = aws_sqs_queue.cart_dlq.arn
+  }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  EventBridge rule → routes order events to the SQS queue
 # ─────────────────────────────────────────────────────────────────────────────
 
 resource "aws_cloudwatch_event_rule" "order" {

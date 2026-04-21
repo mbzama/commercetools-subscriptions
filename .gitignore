@@ -21,6 +21,9 @@ terraform/override.tf.json
 # Node / client
 client/node_modules/
 
+# VS Code
+.vscode/
+
 # macOS
 .DS_Store
 **/.DS_Store

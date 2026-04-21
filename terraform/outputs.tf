@@ -32,3 +32,18 @@ output "dlq_url" {
   description = "Dead-letter queue URL"
   value       = aws_sqs_queue.dlq.url
 }
+
+output "cart_events_queue_url" {
+  description = "URL of the ct-cart-events SQS queue"
+  value       = aws_sqs_queue.cart_events.url
+}
+
+output "cart_events_queue_arn" {
+  description = "ARN of the ct-cart-events SQS queue"
+  value       = aws_sqs_queue.cart_events.arn
+}
+
+output "cart_dlq_url" {
+  description = "Dead-letter queue URL for cart events"
+  value       = aws_sqs_queue.cart_dlq.url
+}

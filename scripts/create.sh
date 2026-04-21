@@ -17,6 +17,17 @@
 
 set -euo pipefail
 
+# Load .env from repo root if present (shell exports take precedence)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/../.env"
+if [ -f "$ENV_FILE" ]; then
+  echo "→ Loading variables from .env..."
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
 : "${CT_CLIENT_ID:?}"
 : "${CT_CLIENT_SECRET:?}"
 : "${CT_PROJECT_KEY:?}"
@@ -37,8 +48,27 @@ STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
   "${CT_API_URL}/${CT_PROJECT_KEY}/subscriptions/key=${SUBSCRIPTION_KEY}" \
   -H "Authorization: Bearer ${TOKEN}")
 
+MESSAGES='[{"resourceTypeId":"order","types":[]},{"resourceTypeId":"cart","types":[]}]'
+
 if [ "$STATUS" = "200" ]; then
-  echo "✓ Subscription '${SUBSCRIPTION_KEY}' already exists — nothing to do."
+  echo "→ Subscription '${SUBSCRIPTION_KEY}' already exists — updating messages to include order + cart..."
+  VERSION=$(curl -s "${CT_API_URL}/${CT_PROJECT_KEY}/subscriptions/key=${SUBSCRIPTION_KEY}" \
+    -H "Authorization: Bearer ${TOKEN}" | jq -r '.version')
+
+  RESPONSE=$(curl -sf -X POST "${CT_API_URL}/${CT_PROJECT_KEY}/subscriptions/key=${SUBSCRIPTION_KEY}" \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"version\": ${VERSION},
+      \"actions\": [
+        {
+          \"action\": \"setMessages\",
+          \"messages\": ${MESSAGES}
+        }
+      ]
+    }")
+
+  echo "✓ Subscription updated: $(echo "$RESPONSE" | jq -r '.id')"
   echo "  Partner event source: aws.partner/commercetools.com/${CT_PROJECT_KEY}/${SUBSCRIPTION_KEY}"
   exit 0
 fi
@@ -54,12 +84,7 @@ RESPONSE=$(curl -sf -X POST "${CT_API_URL}/${CT_PROJECT_KEY}/subscriptions" \
       \"accountId\": \"${AWS_ACCOUNT_ID}\",
       \"region\": \"${AWS_REGION}\"
     },
-    \"messages\": [
-      {
-        \"resourceTypeId\": \"order\",
-        \"types\": []
-      }
-    ]
+    \"messages\": ${MESSAGES}
   }")
 
 SUBSCRIPTION_ID=$(echo "$RESPONSE" | jq -r '.id')

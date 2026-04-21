@@ -5,12 +5,16 @@ const {
 } = require("@aws-sdk/client-sqs");
 
 const client = new SQSClient({ region: process.env.AWS_REGION });
-const QUEUE_URL = process.env.SQS_QUEUE_URL;
 
-async function receiveMessages() {
+const QUEUES = {
+  order: process.env.SQS_ORDERS_QUEUE_URL,
+  cart: process.env.SQS_CART_QUEUE_URL,
+};
+
+async function receiveMessages(queueUrl) {
   const response = await client.send(
     new ReceiveMessageCommand({
-      QueueUrl: QUEUE_URL,
+      QueueUrl: queueUrl,
       MaxNumberOfMessages: 10,
       WaitTimeSeconds: 20, // long polling
       AttributeNames: ["All"],
@@ -21,16 +25,16 @@ async function receiveMessages() {
   return response.Messages ?? [];
 }
 
-async function deleteMessage(receiptHandle) {
+async function deleteMessage(queueUrl, receiptHandle) {
   await client.send(
     new DeleteMessageCommand({
-      QueueUrl: QUEUE_URL,
+      QueueUrl: queueUrl,
       ReceiptHandle: receiptHandle,
     })
   );
 }
 
-async function processMessage(message) {
+async function processMessage(message, queueType) {
   let event;
 
   try {
@@ -42,26 +46,26 @@ async function processMessage(message) {
   }
 
   const detail = event.detail ?? {};
-  const orderId = detail.resource?.id ?? "unknown";
+  const resourceId = detail.resource?.id ?? "unknown";
   const messageType = detail.type ?? "unknown";
   const projectKey = detail.projectKey ?? "unknown";
 
-  console.log(`[${new Date().toISOString()}] ${messageType} | order: ${orderId} | project: ${projectKey}`);
+  console.log(`[${new Date().toISOString()}] ${messageType} | ${queueType}: ${resourceId} | project: ${projectKey}`);
 
   // TODO: add your business logic here
   // e.g. forward to another service, update a database, trigger a workflow
 }
 
-async function poll() {
-  console.log(`Polling ${QUEUE_URL} ...`);
+async function pollQueue(queueType, queueUrl) {
+  console.log(`Polling ${queueType} queue: ${queueUrl} ...`);
 
   while (true) {
     let messages;
 
     try {
-      messages = await receiveMessages();
+      messages = await receiveMessages(queueUrl);
     } catch (err) {
-      console.error("Error receiving messages:", err.message);
+      console.error(`[${queueType}] Error receiving messages:`, err.message);
       await sleep(5000);
       continue;
     }
@@ -72,14 +76,24 @@ async function poll() {
 
     for (const message of messages) {
       try {
-        await processMessage(message);
-        await deleteMessage(message.ReceiptHandle);
+        await processMessage(message, queueType);
+        await deleteMessage(queueUrl, message.ReceiptHandle);
       } catch (err) {
-        console.error(`Error processing message ${message.MessageId}:`, err.message);
+        console.error(`[${queueType}] Error processing message ${message.MessageId}:`, err.message);
         // message will become visible again after visibility timeout
       }
     }
   }
+}
+
+async function poll() {
+  const activeQueues = Object.entries(QUEUES).filter(([, url]) => url);
+
+  if (activeQueues.length === 0) {
+    throw new Error("No queue URLs configured. Set SQS_ORDERS_QUEUE_URL and/or SQS_CART_QUEUE_URL.");
+  }
+
+  await Promise.all(activeQueues.map(([queueType, queueUrl]) => pollQueue(queueType, queueUrl)));
 }
 
 function sleep(ms) {

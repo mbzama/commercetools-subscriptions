@@ -1,6 +1,6 @@
 # commercetools → AWS EventBridge Subscriptions
 
-Routes commercetools order events to an AWS SQS queue via EventBridge, then consumes them with a Node.js client.
+Routes commercetools order and cart events to AWS SQS queues via EventBridge, then consumes them with a Node.js client.
 
 ## How It Works
 
@@ -25,8 +25,9 @@ The setup is split into two deliberate stages:
 │  Reads the partner event source by name and provisions:         │
 │  • CloudWatch Logs resource policy                              │
 │  • Custom EventBridge event bus                                 │
-│  • EventBridge rule (filter: order events)                      │
-│  • SQS queue + Dead-letter queue                                │
+│  • EventBridge rule for order events → ct-order-events SQS     │
+│  • EventBridge rule for cart events  → ct-cart-events SQS      │
+│  • SQS queues + Dead-letter queues (one pair per resource type) │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -38,29 +39,42 @@ The setup is split into two deliberate stages:
 
 ```
 commercetools Platform
-        │  OrderCreated, OrderStateChanged
+        │  OrderCreated, OrderStateChanged, CartCreated, CartUpdated, ...
         ▼
 CT Subscriptions API  ←── Stage 1: you call this once
         │  creates partner event source in AWS
         ▼
 AWS EventBridge (Custom Event Bus)  ←── Stage 2: Terraform manages this
-        │  rule: detail.resource.typeId = "order"
-        ▼
-SQS Queue: ct-order-events
-        │  long-poll
-        ▼
-Node.js Consumer (client/)
-        │  on failure (×3)
-        ▼
-SQS Dead-Letter Queue (DLQ)
+        ├── rule: detail.resource.typeId = "order"
+        │         ▼
+        │   SQS Queue: ct-order-events
+        │         │  long-poll
+        │         ▼
+        │   Node.js Consumer (order)
+        │         │  on failure (×3)
+        │         ▼
+        │   SQS Dead-Letter Queue (order DLQ)
+        │
+        └── rule: detail.resource.typeId = "cart"
+                  ▼
+            SQS Queue: ct-cart-events
+                  │  long-poll
+                  ▼
+            Node.js Consumer (cart)
+                  │  on failure (×3)
+                  ▼
+            SQS Dead-Letter Queue (cart DLQ)
 ```
 
 ## Repository Structure
 
 ```
-├── scripts/        # CT API helpers — create/delete subscriptions without Terraform
-├── terraform/      # AWS infrastructure only — no CT secrets
-└── client/         # Node.js SQS consumer
+├── .env.example        # Template for CT credentials and subscription config
+├── scripts/
+│   ├── create.sh       # Stage 1 — creates/updates CT subscription via API
+│   └── destroy.sh      # Teardown — destroys AWS infra then deletes CT subscription
+├── terraform/          # Stage 2 — AWS infrastructure only, no CT secrets
+└── client/             # Node.js SQS consumer (polls both order and cart queues)
 ```
 
 ---
@@ -73,48 +87,66 @@ SQS Dead-Letter Queue (DLQ)
 |---|---|
 | `curl` + `jq` | Stage 1 — call the CT API |
 | Terraform >= 1.3.0 | Stage 2 — provision AWS resources |
-| AWS credentials | Permissions for EventBridge, SQS, CloudWatch Logs, IAM |
+| AWS credentials configured (`aws configure`) | Permissions for EventBridge, SQS, CloudWatch Logs, IAM |
 | CT API client | Scope: `manage_subscriptions:<project-key>` |
+
+---
+
+### 0. Configure environment variables
+
+Both scripts load variables from a `.env` file in the repo root. Shell exports always take precedence over `.env` values.
+
+```bash
+cp .env.example .env
+# fill in your values
+```
+
+**`.env` variables:**
+
+| Variable | Description |
+|---|---|
+| `CT_CLIENT_ID` | commercetools API client ID |
+| `CT_CLIENT_SECRET` | commercetools API client secret |
+| `CT_PROJECT_KEY` | commercetools project key |
+| `CT_AUTH_URL` | CT auth URL (e.g. `https://auth.us-east-2.aws.commercetools.com`) |
+| `CT_API_URL` | CT API URL (e.g. `https://api.us-east-2.aws.commercetools.com`) |
+| `AWS_ACCOUNT_ID` | AWS account ID |
+| `AWS_REGION` | AWS region (e.g. `us-east-2`) |
+| `SUBSCRIPTION_KEY` | Unique key for the CT subscription (e.g. `orders-dev1`) |
+
+> `.env` is git-ignored — never commit it.
 
 ---
 
 ### Stage 1 — CT API creates the EventBridge partner event source
 
-> **This runs once per environment.** CT registers a partner event source in your AWS account that Terraform reads in Stage 2.
+> **This runs once per environment.** CT registers a partner event source in your AWS account that Terraform reads in Stage 2. Re-running is safe — if the subscription already exists it will be updated to include both `order` and `cart` resource types.
 
 ```bash
-export CT_CLIENT_ID=<your-client-id>
-export CT_CLIENT_SECRET=<your-client-secret>
-export CT_PROJECT_KEY=ps-ecomm-dev1
-export CT_AUTH_URL=https://auth.us-east-2.aws.commercetools.com
-export CT_API_URL=https://api.us-east-2.aws.commercetools.com
-export AWS_ACCOUNT_ID=<your-aws-account-id>
-export AWS_REGION=us-east-2
-export SUBSCRIPTION_KEY=orders-dev1
-
-bash scripts/create-ct-subscription.sh
+bash scripts/create.sh
 ```
 
 The script:
-1. Fetches a short-lived CT token — credentials are never written to disk
-2. Checks if the subscription already exists (idempotent — safe to re-run)
-3. Creates the subscription, which causes CT to register the partner event source in AWS:
+1. Loads variables from `.env`
+2. Fetches a short-lived CT token — credentials never written to disk
+3. Checks if the subscription already exists
+   - **New:** creates it with `order` + `cart` messages
+   - **Existing:** updates it via `setMessages` to ensure both resource types are included
+4. CT registers the partner event source in AWS:
    ```
-   aws.partner/commercetools.com/ps-ecomm-dev1/orders-dev1
+   aws.partner/commercetools.com/<project-key>/<subscription-key>
    ```
 
 **Verify the partner event source was created:**
 ```bash
-# Get token
 TOKEN=$(curl -sf -X POST "$CT_AUTH_URL/oauth/token" \
   -u "$CT_CLIENT_ID:$CT_CLIENT_SECRET" \
   -d "grant_type=client_credentials&scope=manage_subscriptions:$CT_PROJECT_KEY" \
   | jq -r '.access_token')
 
-# List subscriptions
 curl -s "$CT_API_URL/$CT_PROJECT_KEY/subscriptions" \
   -H "Authorization: Bearer $TOKEN" \
-  | jq '.results[] | {key, status, source: .destination.source}'
+  | jq '.results[] | {key, status, messages}'
 ```
 
 Expected output:
@@ -122,13 +154,16 @@ Expected output:
 {
   "key": "orders-dev1",
   "status": "Healthy",
-  "source": "aws.partner/commercetools.com/ps-ecomm-dev1/orders-dev1"
+  "messages": [
+    { "resourceTypeId": "order", "types": [] },
+    { "resourceTypeId": "cart",  "types": [] }
+  ]
 }
 ```
 
 ---
 
-### Stage 2 — Terraform provisions the AWS event bus, rule, and SQS queue
+### Stage 2 — Terraform provisions the AWS event bus, rules, and SQS queues
 
 > **Run this after Stage 1.** Terraform looks up the partner event source by name and builds all AWS resources around it.
 
@@ -145,8 +180,8 @@ Edit `terraform.tfvars`:
 aws_region       = "us-east-2"
 aws_account_id   = "<your-aws-account-id>"
 environment      = "dev"
-ct_project_key   = "ps-ecomm-dev1"
-subscription_key = "orders-dev1"   # must match the key used in Stage 1
+ct_project_key   = "<your-ct-project-key>"   # must match CT_PROJECT_KEY in .env
+subscription_key = "orders-dev1"              # must match SUBSCRIPTION_KEY in .env
 ```
 
 **2. Apply:**
@@ -159,43 +194,183 @@ terraform apply
 
 Terraform creates:
 
-| Resource | Name / ARN |
+| Resource | Name |
 |---|---|
-| CloudWatch Logs resource policy | `ps-ecomm-dev1-dev-eventbridge-log-delivery` |
-| EventBridge event bus | `aws.partner/commercetools.com/ps-ecomm-dev1/orders-dev1` |
-| EventBridge rule | `ps-ecomm-dev1-dev-ct-order-rule` |
-| SQS queue | `ct-order-events` |
-| SQS dead-letter queue | `ps-ecomm-dev1-dev-ct-order-events-dlq` |
+| CloudWatch Logs resource policy | `<project>-<env>-eventbridge-log-delivery` |
+| EventBridge event bus | `aws.partner/commercetools.com/<project>/<subscription-key>` |
+| EventBridge rule (orders) | `<project>-<env>-ct-order-rule` |
+| EventBridge rule (cart) | `<project>-<env>-ct-cart-rule` |
+| SQS queue (orders) | `ct-order-events` |
+| SQS queue (cart) | `ct-cart-events` |
+| SQS dead-letter queue (orders) | `<project>-<env>-ct-order-events-dlq` |
+| SQS dead-letter queue (cart) | `<project>-<env>-ct-cart-events-dlq` |
 
 **3. Note the outputs:**
 
 ```
 order_events_queue_url = "https://sqs.us-east-2.amazonaws.com/..."
+cart_events_queue_url  = "https://sqs.us-east-2.amazonaws.com/..."
 dlq_url                = "https://sqs.us-east-2.amazonaws.com/..."
-event_bus_name         = "aws.partner/commercetools.com/ps-ecomm-dev1/orders-dev1"
+cart_dlq_url           = "https://sqs.us-east-2.amazonaws.com/..."
+event_bus_name         = "aws.partner/commercetools.com/<project>/<subscription-key>"
 ```
 
 ---
 
 ### Stage 3 — Start the Node.js consumer
 
+**1. Install dependencies:**
+
 ```bash
 cd client
 npm install
+```
+
+**2. Configure environment variables** (`client/.env`):
+
+```bash
 cp .env.example .env
-# fill in AWS_REGION and SQS_QUEUE_URL from terraform output
+```
+
+Edit `client/.env`:
+
+```bash
+AWS_REGION=us-east-2
+SQS_ORDERS_QUEUE_URL=<value from: terraform output order_events_queue_url>
+SQS_CART_QUEUE_URL=<value from: terraform output cart_events_queue_url>
+
+# AWS credentials — choose one method:
+# Option A: explicit keys
+AWS_ACCESS_KEY_ID=<your-access-key-id>
+AWS_SECRET_ACCESS_KEY=<your-secret-access-key>
+AWS_SESSION_TOKEN=<your-session-token>   # only if using temporary credentials
+
+# Option B: omit all three above and use ~/.aws/credentials or an IAM role
+```
+
+| Variable | Required | Description |
+|---|---|---|
+| `AWS_REGION` | Yes | e.g. `us-east-2` |
+| `SQS_ORDERS_QUEUE_URL` | At least one | From `terraform output order_events_queue_url` |
+| `SQS_CART_QUEUE_URL` | At least one | From `terraform output cart_events_queue_url` |
+| `AWS_ACCESS_KEY_ID` | No | AWS access key (or use IAM role / `~/.aws/credentials`) |
+| `AWS_SECRET_ACCESS_KEY` | No | AWS secret key |
+| `AWS_SESSION_TOKEN` | No | Required when using temporary credentials |
+
+> Both queue URLs are optional individually — the consumer polls whichever are set. At least one must be provided.
+
+**3. Start the consumer:**
+
+```bash
 npm start
 ```
 
-**Required environment variables** (`client/.env`):
+Or with auto-restart on file changes during development:
 
-| Variable | Description |
-|---|---|
-| `AWS_REGION` | `us-east-2` |
-| `SQS_QUEUE_URL` | From `terraform output order_events_queue_url` |
-| `AWS_ACCESS_KEY_ID` | AWS access key |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
-| `AWS_SESSION_TOKEN` | Required when using temporary credentials |
+```bash
+npm run dev
+```
+
+**Expected output:**
+
+```
+Polling order queue: https://sqs.us-east-2.amazonaws.com/.../ct-order-events ...
+Polling cart queue:  https://sqs.us-east-2.amazonaws.com/.../ct-cart-events ...
+```
+
+When commercetools emits events, messages appear as they are received:
+
+```
+Received message <id> with body: { ... }
+[2026-04-20T10:00:00.000Z] OrderCreated | order: abc-123 | project: ps-ecomm-staging
+Received message <id> with body: { ... }
+[2026-04-20T10:00:01.000Z] CartCreated  | cart:  xyz-456 | project: ps-ecomm-staging
+```
+
+Each message is deleted from the queue immediately after successful processing. If processing throws an error the message becomes visible again after the 60-second visibility timeout and is retried up to 3 times before moving to the DLQ.
+
+**4. Stop the consumer:**
+
+```bash
+Ctrl+C
+```
+
+---
+
+## Teardown
+
+Remove the environment in this exact order. Reversing the order will leave orphaned resources.
+
+**Option A — automated (recommended):**
+
+```bash
+# Ensure .env is populated, then:
+bash scripts/destroy.sh
+```
+
+The script runs all steps sequentially and verifies everything is removed at the end.
+
+**Option B — manual step-by-step:**
+
+### Step 1 — Stop the Node.js consumer
+
+```bash
+# Ctrl+C in the terminal running npm start
+# or if running as a background process:
+pkill -f "node src/index.js"
+```
+
+---
+
+### Step 2 — Destroy AWS infrastructure (Terraform)
+
+Removes the event bus, rules, SQS queues, and CloudWatch Logs resource policy.
+
+```bash
+cd terraform
+terraform destroy -auto-approve
+```
+
+> **Why before Step 3?** The event bus must be deleted before the CT subscription. If you delete the CT subscription first, the partner event source disappears from AWS and Terraform loses its reference — `terraform destroy` will error.
+
+---
+
+### Step 3 — Delete the CT subscription (removes partner event source from AWS)
+
+```bash
+TOKEN=$(curl -sf -X POST "$CT_AUTH_URL/oauth/token" \
+  -u "$CT_CLIENT_ID:$CT_CLIENT_SECRET" \
+  -d "grant_type=client_credentials&scope=manage_subscriptions:$CT_PROJECT_KEY" \
+  | jq -r '.access_token')
+
+VERSION=$(curl -s "$CT_API_URL/$CT_PROJECT_KEY/subscriptions/key=$SUBSCRIPTION_KEY" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.version')
+
+curl -s -X DELETE "$CT_API_URL/$CT_PROJECT_KEY/subscriptions/key=$SUBSCRIPTION_KEY?version=$VERSION" \
+  -H "Authorization: Bearer $TOKEN" | jq '{id, key}'
+```
+
+---
+
+### Step 4 — Verify everything is removed
+
+```bash
+TOKEN=$(curl -sf -X POST "$CT_AUTH_URL/oauth/token" \
+  -u "$CT_CLIENT_ID:$CT_CLIENT_SECRET" \
+  -d "grant_type=client_credentials&scope=manage_subscriptions:$CT_PROJECT_KEY" \
+  | jq -r '.access_token')
+
+# CT subscriptions
+curl -s "$CT_API_URL/$CT_PROJECT_KEY/subscriptions" \
+  -H "Authorization: Bearer $TOKEN" | jq '{total: .total}'
+
+# EventBridge buses
+aws events list-event-buses \
+  --name-prefix "aws.partner/commercetools.com" \
+  --region $AWS_REGION | jq '.EventBuses | length'
+```
+
+Expected: `{ "total": 0 }` and `0`
 
 ---
 
@@ -215,11 +390,11 @@ Provisioned by `aws_cloudwatch_log_resource_policy` in Terraform. Without it, CT
 
 > _Permissions are set correctly to allow AWS CloudWatch Logs to write into your logs while creating a subscription._
 
-> **Important:** Run `terraform apply` (Stage 2) **before** creating the CT subscription (Stage 1) so this policy exists when CT validates the destination.
+> **Important:** Run `terraform apply` (Stage 2) **before** running `scripts/create.sh` (Stage 1) so this policy exists when CT validates the destination.
 
-### 2. SQS queue policy (EventBridge → SQS delivery)
+### 2. SQS queue policies (EventBridge → SQS delivery)
 
-Allows `events.amazonaws.com` to send messages, scoped to the specific rule ARN:
+Each queue (order and cart) has its own policy allowing `events.amazonaws.com` to send messages, scoped to its specific rule ARN:
 
 ```json
 {
@@ -233,11 +408,11 @@ Allows `events.amazonaws.com` to send messages, scoped to the specific rule ARN:
 }
 ```
 
-Provisioned by `aws_sqs_queue_policy` in Terraform.
+Provisioned by `aws_sqs_queue_policy` in Terraform for both queues.
 
 ### 3. SQS encryption — SSE-SQS, not SSE-KMS
 
-Both queues use `sqs_managed_sse_enabled = true`. **Do not use `kms_master_key_id = "alias/aws/sqs"`.**
+All queues use `sqs_managed_sse_enabled = true`. **Do not use `kms_master_key_id = "alias/aws/sqs"`.**
 
 | Mode | How it works | EventBridge compatible |
 |---|---|---|
@@ -248,10 +423,11 @@ For SSE-KMS, use a customer-managed key with an explicit grant to `events.amazon
 
 ---
 
-## EventBridge Rule Pattern
+## EventBridge Rule Patterns
 
-The rule matches on the actual CT event structure. **Do not use the flat `resource_type_id` field** — it does not exist in the event payload.
+Rules match on the actual CT event structure. **Do not use the flat `resource_type_id` field** — it does not exist in the event payload.
 
+**Order rule:**
 ```json
 {
   "detail": {
@@ -262,6 +438,19 @@ The rule matches on the actual CT event structure. **Do not use the flat `resour
 }
 ```
 
+**Cart rule:**
+```json
+{
+  "detail": {
+    "resource": {
+      "typeId": ["cart"]
+    }
+  }
+}
+```
+
+Both rules share the same event bus — EventBridge routes each event to the matching queue based on `typeId`.
+
 ---
 
 ## Managing Subscriptions
@@ -270,104 +459,17 @@ The rule matches on the actual CT event structure. **Do not use the flat `resour
 ```bash
 curl -s "$CT_API_URL/$CT_PROJECT_KEY/subscriptions" \
   -H "Authorization: Bearer $TOKEN" \
-  | jq '.results[] | {key, status, source: .destination.source}'
+  | jq '.results[] | {key, status, messages}'
 ```
 
 **Delete a subscription:**
 ```bash
-# Get version first
 curl -s "$CT_API_URL/$CT_PROJECT_KEY/subscriptions/key=<KEY>" \
   -H "Authorization: Bearer $TOKEN" | jq '{key, version}'
 
-# Delete
 curl -s -X DELETE "$CT_API_URL/$CT_PROJECT_KEY/subscriptions/key=<KEY>?version=<VERSION>" \
   -H "Authorization: Bearer $TOKEN" | jq '{id, key}'
 ```
-
-**Tear down all AWS resources:**
-```bash
-cd terraform && terraform destroy
-```
-
----
-
-## Teardown
-
-Remove the environment in this exact order. Reversing the order will leave orphaned resources.
-
----
-
-### Step 1 — Stop the Node.js consumer
-
-```bash
-# Ctrl+C in the terminal running npm start
-# or if running as a background process:
-pkill -f "node src/index.js"
-```
-
----
-
-### Step 2 — Destroy AWS infrastructure (Terraform)
-
-Removes the event bus, rule, SQS queues, and CloudWatch Logs resource policy.
-
-```bash
-cd terraform
-terraform destroy -auto-approve
-```
-
-> **Why before Step 3?** The event bus must be deleted before the CT subscription is deleted. If you delete the CT subscription first, the partner event source disappears from AWS and Terraform loses its reference — `terraform destroy` will error.
-
----
-
-### Step 3 — Delete the CT subscription (removes partner event source from AWS)
-
-Get a token, then delete the subscription by key.
-
-```bash
-# Get token
-TOKEN=$(curl -sf -X POST "https://auth.us-east-2.aws.commercetools.com/oauth/token" \
-  -u "$CT_CLIENT_ID:$CT_CLIENT_SECRET" \
-  -d "grant_type=client_credentials&scope=manage_subscriptions:$CT_PROJECT_KEY" \
-  | jq -r '.access_token')
-
-# Get current version
-VERSION=$(curl -s "https://api.us-east-2.aws.commercetools.com/$CT_PROJECT_KEY/subscriptions/key=orders-dev1" \
-  -H "Authorization: Bearer $TOKEN" | jq -r '.version')
-
-# Delete
-curl -s -X DELETE "https://api.us-east-2.aws.commercetools.com/$CT_PROJECT_KEY/subscriptions/key=orders-dev1?version=$VERSION" \
-  -H "Authorization: Bearer $TOKEN" | jq '{id, key}'
-```
-
-Deleting the subscription removes the partner event source `aws.partner/commercetools.com/<project>/orders-dev1` from AWS automatically.
-
----
-
-### Step 4 — Verify everything is removed
-
-```bash
-# Confirm no CT subscriptions remain
-TOKEN=$(curl -sf -X POST "https://auth.us-east-2.aws.commercetools.com/oauth/token" \
-  -u "$CT_CLIENT_ID:$CT_CLIENT_SECRET" \
-  -d "grant_type=client_credentials&scope=manage_subscriptions:$CT_PROJECT_KEY" \
-  | jq -r '.access_token')
-
-curl -s "https://api.us-east-2.aws.commercetools.com/$CT_PROJECT_KEY/subscriptions" \
-  -H "Authorization: Bearer $TOKEN" | jq '{total: .total}'
-
-# Confirm no event buses remain
-aws events list-event-buses \
-  --name-prefix "aws.partner/commercetools.com" \
-  --region us-east-2 | jq '.EventBuses | length'
-
-# Confirm SQS queues are gone
-aws sqs list-queues \
-  --queue-name-prefix "ct-order-events" \
-  --region us-east-2 | jq '.QueueUrls'
-```
-
-Expected output: `{ "total": 0 }`, `0`, `null`
 
 ---
 
@@ -375,19 +477,23 @@ Expected output: `{ "total": 0 }`, `0`, `null`
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| CT subscription creation fails with CloudWatch Logs permissions error | CloudWatch Logs resource policy doesn't exist yet | Run `terraform apply` (Stage 2) before creating the CT subscription (Stage 1) |
+| `CT_CLIENT_ID: parameter null or not set` when running a script | `.env` file missing or not populated | `cp .env.example .env` and fill in values |
+| CT subscription creation fails with CloudWatch Logs permissions error | CloudWatch Logs resource policy doesn't exist yet | Run `terraform apply` (Stage 2) before `scripts/create.sh` (Stage 1) |
 | EventBridge logs show `NO_STANDARD_RULES_MATCHED` | Rule pattern uses `detail.resource_type_id` instead of `detail.resource.typeId` | Update the event pattern to use the nested `resource.typeId` field |
 | `RULE_MATCH_START` in logs but no messages in SQS or DLQ | Queue uses SSE-KMS with `alias/aws/sqs` — EventBridge can't call `kms:GenerateDataKey` | Switch to `sqs_managed_sse_enabled = true` |
-| `DuplicateField` error on subscription creation | Subscription key already exists in CT | Use a different key or delete the existing subscription first |
+| `DuplicateField` error on subscription creation | Subscription key already exists in CT | Re-run `create.sh` — it will update the existing subscription instead |
+| `terraform destroy` errors about missing event source | CT subscription was deleted before Terraform destroy | Manually delete the event bus via AWS console, then re-run destroy |
+| Cart messages not appearing in `ct-cart-events` | Subscription missing `cart` resource type | Re-run `bash scripts/create.sh` — it will add cart to the existing subscription |
+| Consumer only polling one queue | `SQS_CART_QUEUE_URL` not set in `client/.env` | Add `SQS_CART_QUEUE_URL` from `terraform output cart_events_queue_url` |
 
 ---
 
 ## Security
 
-- CT credentials (`CT_CLIENT_ID`, `CT_CLIENT_SECRET`) are only used in Stage 1 as shell env vars — never written to Terraform state or `.tfvars` files
-- `terraform/terraform.tfvars` and `client/.env` are git-ignored
+- CT credentials live only in `.env` (git-ignored) — never written to Terraform state or `.tfvars` files
+- `terraform/terraform.tfvars`, `.env`, and `client/.env` are all git-ignored
 - SQS queues use SSE-SQS — transparent encryption, no KMS overhead
-- SQS queue policy restricts delivery to EventBridge only, scoped by rule ARN
+- SQS queue policies restrict delivery to EventBridge only, each scoped by its rule ARN
 - For production, use IAM roles instead of long-lived access keys for the Node.js consumer
 
 ## References
